@@ -129,3 +129,9 @@ Options:
 - `./run.sh -v` - Verbose output
 - `./run.sh --dry-run` - Check without saving changes
 - `./run.sh --simulate` - Test change detection
+
+### Noise filtering
+
+USCIS regenerates some fields on every sync and occasionally returns bad responses. The watcher handles both so the changelog only records real changes:
+- Per-event `eventId`, `updatedAt` and `updatedAtTimestamp` are ignored when comparing.
+- Empty/failed responses (`data: null`, Status 204/400) and a changed `formType` are treated as API glitches: they are reported on the console, not saved, and not logged.

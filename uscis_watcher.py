@@ -261,6 +261,39 @@ DATA_SOURCES = {
 }
 
 
+# Per-event fields USCIS regenerates on every sync without anything actually changing
+VOLATILE_EVENT_FIELDS = ("eventId", "updatedAt", "updatedAtTimestamp")
+
+
+def strip_volatile_fields(data: dict) -> dict:
+    """Return a copy of data without the per-event fields that change on every sync"""
+    stripped = copy.deepcopy(data)
+    inner = stripped.get("data") if isinstance(stripped, dict) else None
+    if isinstance(inner, dict):
+        for event in inner.get("events") or []:
+            for field in VOLATILE_EVENT_FIELDS:
+                event.pop(field, None)
+    return stripped
+
+
+def find_api_glitch(source_key: str, old_data: dict, new_data: dict) -> Optional[str]:
+    """Return a reason if new_data looks like a USCIS API glitch rather than a real case change"""
+    old_inner = old_data.get("data")
+    new_inner = new_data.get("data")
+
+    # Failed or empty response (Status 204/400, data: null) after we had real data
+    if old_inner and not new_inner:
+        return new_data.get("error") or "empty response"
+
+    # A case never changes form type; USCIS occasionally serves another record
+    if source_key == "case_details" and isinstance(old_inner, dict) and isinstance(new_inner, dict):
+        old_form, new_form = old_inner.get("formType"), new_inner.get("formType")
+        if old_form and new_form and old_form != new_form:
+            return f"formType {old_form} -> {new_form}"
+
+    return None
+
+
 def process_data_source(
     source_key: str,
     nickname: str,
@@ -282,7 +315,23 @@ def process_data_source(
     diff = None
 
     if old_data:
-        diff = DeepDiff(old_data, new_data, ignore_order=True)
+        # Glitches are not saved, so the next good response is diffed against the last good state
+        glitch = find_api_glitch(source_key, old_data, new_data)
+        if glitch:
+            print(f"  {nickname}: {label} ignored (USCIS API glitch: {glitch})")
+            return False, None
+
+        # Baseline saved from an earlier glitch: adopt the good data instead of logging a full-file diff
+        if not old_data.get("data") and new_data.get("data"):
+            print(f"  {nickname}: {label} recovered after a bad response - baseline updated")
+            if not dry_run:
+                save_fn(nickname, new_data)
+            return False, None
+
+        # Compare without the fields USCIS regenerates on every sync (saved data stays untouched)
+        old_cmp = strip_volatile_fields(old_data)
+        new_cmp = strip_volatile_fields(new_data)
+        diff = DeepDiff(old_cmp, new_cmp, ignore_order=True)
         if diff:
             has_changes = True
             # Special handling for case_details (main case data)
@@ -295,12 +344,12 @@ def process_data_source(
                         timestamp = datetime.now().isoformat() + "Z"
                         save_silent_update(nickname, timestamp)
                         # Still log to changelog
-                        changelog_path = append_changelog(nickname, case_number, diff, old_data, new_data)
+                        changelog_path = append_changelog(nickname, case_number, diff, old_cmp, new_cmp)
                 else:
                     # Normal change - alert and log
-                    print_change_alert(nickname, case_number, diff, old_data, new_data)
+                    print_change_alert(nickname, case_number, diff, old_cmp, new_cmp)
                     if not dry_run:
-                        changelog_path = append_changelog(nickname, case_number, diff, old_data, new_data)
+                        changelog_path = append_changelog(nickname, case_number, diff, old_cmp, new_cmp)
                         print(f"  Changelog updated: {changelog_path}")
             # Special handling for receipt_info (show location change)
             elif source_key == "receipt_info":
@@ -311,11 +360,11 @@ def process_data_source(
                 else:
                     print(f"  {nickname}: {label} changed")
                 if not dry_run:
-                    append_changelog(nickname, case_number, diff, old_data, new_data)
+                    append_changelog(nickname, case_number, diff, old_cmp, new_cmp)
             else:
                 print(f"  {nickname}: {label} changed")
                 if not dry_run:
-                    append_changelog(nickname, case_number, diff, old_data, new_data)
+                    append_changelog(nickname, case_number, diff, old_cmp, new_cmp)
         elif source_key == "case_details":
             # Only print "no changes" for main case data
             print(f"  {nickname}: No changes")
@@ -529,12 +578,14 @@ def detect_important_changes(old_data: dict, new_data: dict) -> list[str]:
         time_ago = humanize_time_ago(new_updated)
         messages.append(f"Case updated {time_ago}")
 
-    # Check for new events
-    old_events = {e.get("eventId"): e for e in old_inner.get("events", [])}
+    # Check for new events (eventId is regenerated on every sync, so identify events by content)
+    def event_key(e: dict) -> tuple:
+        return (e.get("eventCode"), e.get("eventDateTime"), e.get("createdAtTimestamp"))
+
+    old_events = {event_key(e) for e in old_inner.get("events", [])}
     new_events = new_inner.get("events", [])
     for event in new_events:
-        event_id = event.get("eventId")
-        if event_id and event_id not in old_events:
+        if event_key(event) not in old_events:
             event_code = event.get("eventCode", "Unknown")
             event_time = event.get("createdAtTimestamp", "")
             time_ago = humanize_time_ago(event_time) if event_time else ""
